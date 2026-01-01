@@ -1,0 +1,49 @@
+{
+  "name": "@lox-audio-server/sonos",
+  "version": "0.1.0",
+  "description": "Sonos Controller",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "import": "./dist/esm/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist/**/*", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "npm run build:cjs && npm run build:esm",
+    "build:cjs": "tsc -p tsconfig.json",
+    "build:esm": "tsc -p tsconfig.esm.json && node -e \"const fs=require('fs');fs.mkdirSync('dist/esm',{recursive:true});fs.writeFileSync('dist/esm/package.json','{\\\"type\\\":\\\"module\\\"}\\n');\"",
+    "clean": "rimraf dist",
+    "prepare": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rudyberends/lox-audio-server-sonos.git"
+  },
+  "bugs": {
+    "url": "https://github.com/rudyberends/lox-audio-server-sonos/issues"
+  },
+  "homepage": "https://github.com/rudyberends/lox-audio-server-sonos#readme",
+  "keywords": ["sonos", "controller", "audio", "streaming"],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "undici": "^6.19.8",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.13",
+    "@types/node": "^22.19.3",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.9.3"
+  },
+  "license": "AGPL-3.0"
+}

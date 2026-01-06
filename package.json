@@ -1,5 +1,5 @@
 {
-  "name": "@lox-audio-server/sonos",
+  "name": "@lox-audioserver/sonos",
   "version": "0.1.0",
   "description": "Sonos Controller",
   "main": "dist/index.js",
@@ -22,12 +22,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rudyberends/lox-audio-server-sonos.git"
+    "url": "git+https://github.com/lox-audioserver/node-sonos.git"
   },
   "bugs": {
-    "url": "https://github.com/rudyberends/lox-audio-server-sonos/issues"
+    "url": "https://github.com/lox-audioserver/node-sonos/issues"
   },
-  "homepage": "https://github.com/rudyberends/lox-audio-server-sonos#readme",
+  "homepage": "https://github.com/lox-audioserver/node-sonos#readme",
   "keywords": ["sonos", "controller", "audio", "streaming"],
   "engines": {
     "node": ">=18"

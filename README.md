@@ -5,7 +5,7 @@ TypeScript Sonos controller that talks directly to the local WebSocket API on a 
 ## Install
 
 ```bash
-npm install @lox-audio-server/sonos
+npm install @lox-audioserver/sonos
 ```
 
 Node.js 18+ is required.
@@ -13,7 +13,7 @@ Node.js 18+ is required.
 ## Usage
 
 ```ts
-import { SonosClient, EventType } from '@lox-audio-server/sonos';
+import { SonosClient, EventType } from '@lox-audioserver/sonos';
 
 async function main() {
 const client = new SonosClient('192.168.1.50'); // IP of any Sonos player

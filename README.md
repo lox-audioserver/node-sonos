@@ -1,11 +1,11 @@
-# lox-sonos-controller
+# node-sonos
 
 TypeScript Sonos controller that talks directly to the local WebSocket API on a Sonos player.
 
 ## Install
 
 ```bash
-npm install @lox-audioserver/sonos
+npm install @lox-audioserver/node-sonos
 ```
 
 Node.js 18+ is required.

@@ -1,6 +1,6 @@
 {
-  "name": "@lox-audioserver/sonos",
-  "version": "0.1.1",
+  "name": "@lox-audioserver/node-sonos",
+  "version": "0.1.2",
   "description": "Sonos Controller",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

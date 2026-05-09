@@ -99,8 +99,49 @@ export class SonosWebSocketApi {
 
     await new Promise<void>((resolve, reject) => {
       if (!this.ws) return reject(new CannotConnect('No websocket'));
+      let upgradeInfo: { statusCode?: number; statusMessage?: string; headers?: Record<string, unknown> } | null = null;
+      this.ws.once('upgrade', (res: { statusCode?: number; statusMessage?: string; headers?: Record<string, unknown> }) => {
+        upgradeInfo = {
+          statusCode: res.statusCode,
+          statusMessage: res.statusMessage,
+          headers: res.headers,
+        };
+        this.logger.debug?.('Sonos WebSocket upgrade response', upgradeInfo);
+      });
+      this.ws.once('unexpected-response', (_req: unknown, res: { statusCode?: number; statusMessage?: string; headers?: Record<string, unknown> }) => {
+        const chunks: Buffer[] = [];
+        const stream = res as unknown as NodeJS.ReadableStream;
+        stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+        stream.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8').slice(0, 512);
+          this.logger.warn?.('Sonos WebSocket upgrade rejected', {
+            url: this.websocketUrl,
+            statusCode: res.statusCode,
+            statusMessage: res.statusMessage,
+            headers: res.headers,
+            body,
+          });
+          reject(
+            new CannotConnect(
+              `Upgrade rejected: ${res.statusCode ?? '?'} ${res.statusMessage ?? ''} body=${body}`,
+            ),
+          );
+        });
+        stream.on('error', () => {
+          reject(
+            new CannotConnect(
+              `Upgrade rejected: ${res.statusCode ?? '?'} ${res.statusMessage ?? ''}`,
+            ),
+          );
+        });
+      });
       this.ws.once('open', () => resolve());
-      this.ws.once('error', (err: Error) => reject(new CannotConnect('Failed to connect', err)));
+      this.ws.once('error', (err: Error) => {
+        const detail = upgradeInfo
+          ? ` (upgrade ${upgradeInfo.statusCode} ${upgradeInfo.statusMessage ?? ''})`
+          : '';
+        reject(new CannotConnect(`Failed to connect${detail}`, err));
+      });
     });
 
     this.ws.on('message', (data: WebSocket.RawData) => this.handleRawMessage(data));

@@ -79,7 +79,22 @@ export class SonosClient {
   }
 
   async connect(options?: SonosClientOptions): Promise<void> {
-    const discovery = await getDiscoveryInfo(this.playerIp, options);
+    let discovery;
+    try {
+      discovery = await getDiscoveryInfo(this.playerIp, options);
+    } catch (err) {
+      this.logger.warn?.('Sonos discovery failed', {
+        playerIp: this.playerIp,
+        message: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
+    this.logger.debug?.('Sonos discovery info', {
+      playerIp: this.playerIp,
+      playerId: discovery.playerId,
+      householdId: discovery.householdId,
+      websocketUrl: discovery.websocketUrl,
+    });
     this.playerId = discovery.playerId;
     this.householdId = discovery.householdId;
     this.api = new SonosWebSocketApi(discovery.websocketUrl, {

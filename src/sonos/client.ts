@@ -212,6 +212,11 @@ export class SonosClient {
         });
       }
     }
+
+    // Re-resolve the local player's active group after any groups-event change.
+    // Without this, the cached activeGroup goes stale when Sonos reshuffles
+    // groups (e.g. after pause), causing follow-up commands to be dropped.
+    this.player?.checkActiveGroup();
   }
 
   private async handleSocketConnected(): Promise<void> {

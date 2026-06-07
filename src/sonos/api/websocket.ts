@@ -84,10 +84,15 @@ export class SonosWebSocketApi {
     this.logger.debug?.(`Connecting to Sonos WebSocket ${this.websocketUrl}`);
     this.stopCalled = false;
     try {
-      this.ws = new WebSocket(this.websocketUrl, {
+      // The Sonos subprotocol MUST be requested via ws's `protocols` argument,
+      // not as a raw Sec-WebSocket-Protocol header. ws only registers a
+      // requested-protocol set when you pass `protocols`; with the header form
+      // that set stays empty, so when Sonos echoes the subprotocol back in its
+      // 101 response ws aborts the handshake with "Server sent a subprotocol but
+      // none was requested" — surfacing as an error immediately after a 101.
+      this.ws = new WebSocket(this.websocketUrl, 'v1.api.smartspeaker.audio', {
         headers: {
           'X-Sonos-Api-Key': LOCAL_API_TOKEN,
-          'Sec-WebSocket-Protocol': 'v1.api.smartspeaker.audio',
         },
         rejectUnauthorized: false,
         perMessageDeflate: true,

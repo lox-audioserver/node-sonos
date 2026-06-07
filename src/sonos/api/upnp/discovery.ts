@@ -6,7 +6,7 @@
 // incur the S1 fallback cost. Returns 'unknown' if neither responds, which
 // usually means the host isn't a Sonos speaker at all.
 
-import { fetch } from 'undici';
+import { Agent, fetch } from 'undici';
 
 export type SonosGeneration = 'S1' | 'S2' | 'unknown';
 
@@ -16,6 +16,7 @@ export interface DetectGenerationOptions {
   signal?: AbortSignal;
   s2TimeoutMs?: number;
   s1TimeoutMs?: number;
+  dispatcher?: Agent;
 }
 
 export async function detectGeneration(
@@ -25,10 +26,19 @@ export async function detectGeneration(
   const s2TimeoutMs = options.s2TimeoutMs ?? 1_500;
   const s1TimeoutMs = options.s1TimeoutMs ?? 3_000;
 
+  // S2 serves this endpoint over a self-signed cert ("Sonos Device
+  // Authentication Root CA"), so we must disable TLS validation — exactly as
+  // getDiscoveryInfo and the WebSocket client do. Without it undici throws
+  // DEPTH_ZERO_SELF_SIGNED_CERT, the probe falls through to the S1 branch, and
+  // since S2 speakers also serve the legacy UPnP description on :1400 we'd
+  // misclassify every S2 unit as S1.
+  const dispatcher = options.dispatcher ?? new Agent({ connect: { rejectUnauthorized: false } });
+
   try {
     const s2Response = await fetch(`https://${host}:1443/api/v1/players/local/info`, {
       method: 'GET',
       headers: { 'X-Sonos-Api-Key': LOCAL_API_TOKEN },
+      dispatcher,
       signal: combineSignals(options.signal, AbortSignal.timeout(s2TimeoutMs)),
     });
     if (s2Response.ok) {

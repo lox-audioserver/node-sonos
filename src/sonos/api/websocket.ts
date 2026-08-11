@@ -77,9 +77,14 @@ export class SonosWebSocketApi {
   }
 
   public async connect(): Promise<void> {
-    if (this.ws) {
+    if (this.connected) {
       throw new InvalidState('Already connected');
     }
+    // A socket that closed on its own stays in `this.ws` until disconnect() clears it. Drop it
+    // here so a reconnect creates a fresh socket instead of failing forever with
+    // 'Already connected' — which left the client permanently unable to reconnect while every
+    // command kept throwing 'Not connected'.
+    this.discardSocket();
 
     this.logger.debug?.(`Connecting to Sonos WebSocket ${this.websocketUrl}`);
     this.stopCalled = false;
@@ -166,50 +171,69 @@ export class SonosWebSocketApi {
 
   public async startListening(): Promise<void> {
     this.stopCalled = false;
+    // Kept outside the loop: a per-iteration counter never grows, so maxReconnects would never
+    // trip and the backoff would stay at its minimum forever.
+    let attempts = 0;
     while (!this.stopCalled) {
-      let attempts = 0;
+      let reason: string | undefined;
       try {
         if (!this.connected) {
           await this.connect();
         }
-        const reason = await this.waitForClose();
+        // A healthy session resets the backoff so a long uptime is not punished by an old
+        // streak of failures.
+        attempts = 0;
+        reason = await this.waitForClose();
         if (this.stopCalled) break;
+        this.discardSocket(reason);
         await this.onDisconnect?.(reason);
         this.logger.warn?.('WebSocket closed, reconnecting...', reason);
-        attempts += 1;
-        if (this.maxReconnects && attempts > this.maxReconnects) {
-          this.logger.error?.('Max reconnect attempts reached');
-          break;
-        }
-        await this.delay(this.computeRetryDelay(attempts));
       } catch (err) {
         if (this.stopCalled) break;
+        reason = err instanceof Error ? err.message : undefined;
+        this.discardSocket(reason);
         this.logger.warn?.('WebSocket listen error, reconnecting...', err);
-        await this.onDisconnect?.(err instanceof Error ? err.message : undefined);
-        attempts += 1;
-        if (this.maxReconnects && attempts > this.maxReconnects) {
-          this.logger.error?.('Max reconnect attempts reached after error');
-          break;
-        }
-        await this.delay(this.computeRetryDelay(attempts));
+        await this.onDisconnect?.(reason);
       }
+      attempts += 1;
+      if (this.maxReconnects && attempts > this.maxReconnects) {
+        this.logger.error?.('Max reconnect attempts reached');
+        break;
+      }
+      await this.delay(this.computeRetryDelay(attempts));
     }
   }
 
   public async disconnect(): Promise<void> {
     this.stopCalled = true;
     this.clearHeartbeat();
-    for (const pending of this.resultFutures.values()) {
-      pending.reject(new ConnectionClosed('Connection closed'));
-    }
-    this.resultFutures.clear();
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       await new Promise<void>((resolve) => {
         this.ws?.once('close', () => resolve());
         this.ws?.close();
       });
     }
+    this.discardSocket('Connection closed');
+  }
+
+  /**
+   * Forgets the current socket and fails every command still waiting on it. Without this a
+   * command issued while the socket dies would hang forever (no result frame is ever coming),
+   * and the stale socket would block the next connect().
+   */
+  private discardSocket(reason = 'Connection closed'): void {
+    this.clearHeartbeat();
+    const ws = this.ws;
     this.ws = undefined;
+    for (const pending of this.resultFutures.values()) {
+      pending.reject(new ConnectionClosed(reason));
+    }
+    this.resultFutures.clear();
+    if (!ws) return;
+    ws.removeAllListeners();
+    if (ws.readyState !== WebSocket.CLOSED) {
+      ws.terminate();
+    }
   }
 
   public async sendCommand(

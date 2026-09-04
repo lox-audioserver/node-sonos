@@ -1,6 +1,6 @@
 # node-sonos
 
-TypeScript Sonos controller for both S2 (modern) and S1 (legacy) firmware. Talks the local WebSocket API on S2 speakers, and falls back to UPnP/SOAP (via [`@svrooij/sonos`](https://www.npmjs.com/package/@svrooij/sonos)) for S1 speakers.
+TypeScript Sonos controller for both S2 (modern) and S1 (legacy) firmware. Talks the local WebSocket API on S2 speakers, and UPnP/SOAP for S1 speakers.
 
 ## Install
 
@@ -89,9 +89,19 @@ await client.connect();
 
 S2-only operations on `S1Client` throw at the call site so consumers can fall back to direct SOAP if needed.
 
+### Testing the S1 backend
+
+There is no S1 hardware in the loop here, so `scripts/s1-probe.mjs` drives `S1Client` against a
+fake speaker (`scripts/fake-s1-speaker.mjs`) that reproduces the wire format: device description,
+SOAP control, and GENA NOTIFYs carrying the double-escaped DIDL that real firmware sends.
+
+```sh
+npm run build && npm run probe:s1
+```
+
 ## Notes
 
 - S2 uses a self-signed TLS certificate on port 1443; the client disables certificate validation for this connection, matching the official behavior.
-- S1 uses plain HTTP/SOAP on port 1400 with UPnP eventing.
+- S1 uses plain HTTP/SOAP on port 1400 with UPnP eventing, built on [`@sonn-audio/node-upnp`](https://www.npmjs.com/package/@sonn-audio/node-upnp) for the SOAP envelopes, DIDL parsing and GENA subscriptions.
 - Only one player connection per client instance (matches the per-player Sonos requirements). Create multiple clients for multiple players.
-- For S1, topology changes (group reshuffles) are detected via SDK events plus a 30 s topology poll as a safety net.
+- For S1, topology changes (group reshuffles) arrive as ZoneGroupTopology events, with a 30 s poll behind them in case a NOTIFY is missed.

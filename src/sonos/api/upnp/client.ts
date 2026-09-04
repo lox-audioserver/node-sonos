@@ -1,22 +1,31 @@
-// Sonos S1 client built on top of @svrooij/sonos.
+// Sonos S1 client, speaking UPnP/SOAP directly.
 //
-// Exposes the same `subscribe/connect/start/disconnect/player/groups` surface
-// the existing S2 SonosClient does, so the state controller in lox-audioserver
-// can switch backends with a single dispatcher decision. The heavy lifting —
-// SOAP, UPnP eventing, topology parsing — is delegated to @svrooij/sonos. We
-// translate its strongly-typed events into our SonosEvent enum and keep the
-// MetadataStatus / PlayBackState shapes that consumers already rely on.
-
-import SonosDevice from '@svrooij/sonos/lib/sonos-device';
-import { SonosEvents } from '@svrooij/sonos/lib/models';
-import type { Track } from '@svrooij/sonos/lib/models/track';
-import type { ZoneGroup } from '@svrooij/sonos/lib/models/zone-group';
+// Exposes the same `subscribe/connect/start/disconnect/player/groups` surface as
+// the S2 SonosClient, so a consumer can switch backends on a single dispatcher
+// decision. S1 firmware has no WebSocket API: state arrives through GENA events
+// (see ./events) and commands go out as SOAP (see ./transport), with the household
+// topology read from ZoneGroupTopology.
 
 import { EventType } from '../../constants';
 import { CannotConnect } from '../../errors';
 import type { SonosEvent } from '../../types';
+import { loadDeviceDescription, type SonosDeviceDescription } from './description';
+import { parseClockToSec, parseTrackMetadata } from './didl';
+import { S1EventBridge } from './events';
 import { S1SonosGroup, type S1GroupSeed } from './group';
-import { S1SonosPlayer, type S1PlayerSeed } from './player';
+import { UpnpTransportState, type UpnpTrack, type ZoneGroup } from './models';
+import { S1SonosPlayer } from './player';
+import { SONOS_UPNP_PORT } from './soap';
+import { getZoneGroups } from './topology';
+import {
+  getMediaInfo,
+  getMute,
+  getPositionInfo,
+  getTransportState,
+  getVolume,
+  sendTransportCommand,
+  type TransportCommand,
+} from './transport';
 
 type Subscriber = {
   cb: (event: SonosEvent) => void;
@@ -26,11 +35,18 @@ type Subscriber = {
 
 export interface S1ClientOptions {
   logger?: Console;
-  // Override the SDK port (defaults to 1400).
+  /** Override the UPnP port (defaults to 1400). */
   port?: number;
-  // How often to poll RelativeTimePosition while playing. AVTransport doesn't
-  // push position; we poll for it. Set to 0 to disable.
+  /**
+   * How often to poll RelativeTimePosition while playing. AVTransport doesn't push
+   * position, so we poll for it. Set to 0 to disable.
+   */
   positionPollIntervalMs?: number;
+  /**
+   * Safety net behind the ZoneGroupTopology events, in case a NOTIFY is missed.
+   * Set to 0 to rely on events alone.
+   */
+  topologyPollIntervalMs?: number;
 }
 
 export class S1Client {
@@ -42,20 +58,28 @@ export class S1Client {
   private readonly port: number;
   private readonly logger: Console;
   private readonly positionPollIntervalMs: number;
+  private readonly topologyPollIntervalMs: number;
 
-  private device: SonosDevice | null = null;
+  private description: SonosDeviceDescription | null = null;
+  private events: S1EventBridge | null = null;
   private groupMap = new Map<string, S1SonosGroup>();
+  private zoneGroups: ZoneGroup[] = [];
   private subscribers: Subscriber[] = [];
   private positionPollTimer: NodeJS.Timeout | null = null;
   private topologyPollTimer: NodeJS.Timeout | null = null;
-  private detachEventListeners: Array<() => void> = [];
   private stopRequested = false;
+
+  // Speaker state, kept current by the GENA events and primed on connect.
+  private transportState: UpnpTransportState | undefined;
+  private volumeLevel: number | undefined;
+  private mutedState: boolean | undefined;
 
   constructor(playerIp: string, options: S1ClientOptions = {}) {
     this.playerIp = playerIp;
-    this.port = options.port ?? 1400;
+    this.port = options.port ?? SONOS_UPNP_PORT;
     this.logger = options.logger ?? console;
     this.positionPollIntervalMs = options.positionPollIntervalMs ?? 5_000;
+    this.topologyPollIntervalMs = options.topologyPollIntervalMs ?? 30_000;
   }
 
   // -------- public surface (mirrors SonosClient) --------
@@ -104,66 +128,32 @@ export class S1Client {
 
   async connect(): Promise<void> {
     this.stopRequested = false;
-    const device = new SonosDevice(this.playerIp, this.port);
-    this.device = device;
 
-    try {
-      await device.LoadDeviceData();
-    } catch (err) {
-      throw new CannotConnect(
-        `Sonos S1 LoadDeviceData failed (${(err as Error).message})`,
-        err instanceof Error ? err : undefined,
-      );
-    }
+    const description = await loadDeviceDescription(this.playerIp, { port: this.port });
+    this.description = description;
+    this.playerId = description.uuid;
+    // S1 has no household id of its own; consumers only compare these for equality,
+    // so the player's own uuid is a stable enough stand-in.
+    this.householdId = description.uuid;
 
-    this.playerId = device.Uuid;
-    // The S1 stack doesn't expose a true "household id"; use the local UUID
-    // as a stable identity placeholder — consumers only check for equality.
-    this.householdId = device.Uuid;
-
-    this.player = new S1SonosPlayer(this, device, {
-      id: device.Uuid,
-      name: device.Name,
-      host: device.Host,
+    this.player = new S1SonosPlayer(this, {
+      id: description.uuid,
+      name: description.name,
+      host: description.host,
     });
 
     await this.refreshTopology();
-    this.wireDeviceEvents();
-
-    // GetState gives us track/transport state immediately so consumers don't
-    // have to wait for the first event tick.
-    try {
-      const state = await device.GetState();
-      const group = this.player?.group ?? null;
-      if (group && state) {
-        group.applyCurrentTrackUri(state.positionInfo?.TrackURI ?? '');
-        if (state.positionInfo?.TrackMetaData && typeof state.positionInfo.TrackMetaData === 'object') {
-          group.applyCurrentTrack(state.positionInfo.TrackMetaData as Track);
-        }
-        if (state.mediaInfo?.CurrentURI) {
-          group.applyEnqueuedTrackUri(state.mediaInfo.CurrentURI);
-        }
-        if (state.mediaInfo?.CurrentURIMetaData && typeof state.mediaInfo.CurrentURIMetaData === 'object') {
-          group.applyEnqueuedTrack(state.mediaInfo.CurrentURIMetaData as Track);
-        }
-        const positionSec = parseClockToSec(state.positionInfo?.RelTime);
-        group.setPosition(positionSec);
-        group.emitUpdated();
-      }
-    } catch {
-      // Best-effort — events will refill state.
-    }
+    await this.primeState();
+    await this.startEvents();
 
     this.signalEvent({ eventType: EventType.CONNECTED, objectId: this.playerId });
     this.startPositionPolling();
     this.startTopologyPolling();
   }
 
-  // start() kept for parity with the S2 client where it bootstraps the event
-  // listener separately. The SDK auto-subscribes when an event handler is
-  // attached, so this is a no-op here.
+  /** Kept for parity with the S2 client, where it bootstraps the event listener. */
   async start(): Promise<void> {
-    /* no-op */
+    /* no-op: connect() already subscribed */
   }
 
   async disconnect(): Promise<void> {
@@ -176,47 +166,71 @@ export class S1Client {
       clearInterval(this.topologyPollTimer);
       this.topologyPollTimer = null;
     }
-    for (const detach of this.detachEventListeners.splice(0)) {
-      try {
-        detach();
-      } catch {
-        // ignore
-      }
-    }
-    if (this.device) {
-      try {
-        // CancelEvents removes all subscriptions registered through this device.
-        await (this.device as unknown as { CancelEvents?: () => Promise<unknown> }).CancelEvents?.();
-      } catch {
-        // ignore
-      }
-      this.device = null;
-    }
+    this.events?.dispose();
+    this.events = null;
     this.signalEvent({ eventType: EventType.DISCONNECTED, objectId: this.playerId });
+  }
+
+  // -------- state the group adapter reads --------
+
+  get currentTransportState(): UpnpTransportState | undefined {
+    return this.transportState;
+  }
+
+  get currentVolume(): number | undefined {
+    return this.volumeLevel;
+  }
+
+  get currentMuted(): boolean | undefined {
+    return this.mutedState;
+  }
+
+  /**
+   * Run a transport command against a group's coordinator. Only the coordinator
+   * accepts them; sending to a joined member is silently ignored by the speaker.
+   */
+  async runTransportCommand(groupId: string, command: TransportCommand): Promise<void> {
+    const { host, port } = this.coordinatorEndpointFor(groupId);
+    await sendTransportCommand(host, command, { port });
+  }
+
+  /**
+   * Where to send a group's commands. The topology carries each member's own
+   * address, which is what to trust — a household is normally all on 1400, but
+   * nothing about the protocol says it has to be.
+   */
+  private coordinatorEndpointFor(groupId: string): { host: string; port: number } {
+    const coordinator = this.zoneGroups.find((g) => g.groupId === groupId)?.coordinator;
+    if (!coordinator?.host) {
+      return { host: this.playerIp, port: this.port };
+    }
+    return { host: coordinator.host, port: coordinator.port || this.port };
   }
 
   // -------- topology --------
 
   private async refreshTopology(): Promise<void> {
-    const device = this.device;
-    if (!device) return;
     let zones: ZoneGroup[];
     try {
-      zones = await device.GetZoneGroupState();
+      zones = await getZoneGroups(this.playerIp, { port: this.port });
     } catch (err) {
       throw new CannotConnect(
         `Sonos S1 GetZoneGroupState failed (${(err as Error).message})`,
         err instanceof Error ? err : undefined,
       );
     }
+    this.applyTopology(zones);
+  }
 
+  private applyTopology(zones: ZoneGroup[]): void {
+    this.zoneGroups = zones;
     const seenIds = new Set<string>();
     for (const zone of zones) {
       const seed: S1GroupSeed = {
         id: zone.groupId,
         coordinatorId: zone.coordinator?.uuid ?? zone.groupId,
         name: zone.name,
-        playerIds: (zone.members ?? []).map((m) => m.uuid),
+        playerIds: zone.members.map((m) => m.uuid),
       };
       seenIds.add(seed.id);
       const existing = this.groupMap.get(seed.id);
@@ -229,7 +243,7 @@ export class S1Client {
           });
         }
       } else {
-        const group = new S1SonosGroup(this, device, seed);
+        const group = new S1SonosGroup(this, seed);
         this.groupMap.set(group.id, group);
         this.signalEvent({
           eventType: EventType.GROUP_ADDED,
@@ -265,79 +279,106 @@ export class S1Client {
   }
 
   private startTopologyPolling(): void {
-    if (this.topologyPollTimer) return;
-    // @svrooij/sonos surfaces coordinator/groupname events on the device, but
-    // doesn't expose a strongly-typed topology-changed event. Poll the topology
-    // every 30s to catch group reshuffles. Cheap (single SOAP call) and
-    // bounded.
+    if (this.topologyPollTimer || this.topologyPollIntervalMs <= 0) return;
+    // ZoneGroupTopology events already report reshuffles; this only covers a NOTIFY
+    // that never arrived. Cheap — one SOAP call.
     this.topologyPollTimer = setInterval(() => {
       if (this.stopRequested) return;
       void this.refreshTopology().catch(() => undefined);
-    }, 30_000);
+    }, this.topologyPollIntervalMs);
     this.topologyPollTimer.unref?.();
   }
 
-  // -------- device event wiring --------
+  // -------- initial state + event wiring --------
 
-  private wireDeviceEvents(): void {
-    const device = this.device;
-    if (!device) return;
+  /**
+   * Events only report *changes*, so a speaker that has been sitting still since
+   * before we subscribed would tell us nothing. Read the current state once.
+   */
+  private async primeState(): Promise<void> {
+    const group = this.player?.group ?? null;
+    const { host, port } = group
+      ? this.coordinatorEndpointFor(group.id)
+      : { host: this.playerIp, port: this.port };
 
-    const events = device.Events;
+    const [state, position, media, volume, muted] = await Promise.all([
+      getTransportState(host, { port }).catch(() => undefined),
+      getPositionInfo(host, { port }).catch(() => undefined),
+      getMediaInfo(host, { port }).catch(() => undefined),
+      getVolume(this.playerIp, { port: this.port }).catch(() => undefined),
+      getMute(this.playerIp, { port: this.port }).catch(() => undefined),
+    ]);
 
-    const onCurrentTrack = (track: Track): void => {
-      this.player?.group?.applyCurrentTrack(track ?? null);
-    };
-    const onCurrentTrackUri = (uri: string): void => {
-      this.player?.group?.applyCurrentTrackUri(uri ?? '');
-    };
-    const onEnqueuedTransport = (track: Track): void => {
-      this.player?.group?.applyEnqueuedTrack(track ?? null);
-    };
-    const onEnqueuedTransportUri = (uri: string): void => {
-      this.player?.group?.applyEnqueuedTrackUri(uri ?? '');
-    };
-    const onTransportState = (): void => {
-      // The device's CurrentTransportStateSimple is already updated under the
-      // hood; we just need to signal an update so consumers re-read the patch.
-      this.player?.group?.emitUpdated();
-    };
-    const onVolume = (): void => {
-      this.player?.group?.emitUpdated();
-    };
-    const onMuted = (): void => {
-      this.player?.group?.emitUpdated();
-    };
-    const onCoordinator = (): void => {
-      // Coordinator change means our group's coordinatorId moved; refresh
-      // topology so members align.
-      void this.refreshTopology().catch(() => undefined);
-    };
-    const onGroupName = (): void => {
-      void this.refreshTopology().catch(() => undefined);
-    };
+    this.transportState = toTransportState(state);
+    this.volumeLevel = volume;
+    this.mutedState = muted;
 
-    events.on(SonosEvents.CurrentTrackMetadata, onCurrentTrack);
-    events.on(SonosEvents.CurrentTrackUri, onCurrentTrackUri);
-    events.on(SonosEvents.EnqueuedTransportMetadata, onEnqueuedTransport);
-    events.on(SonosEvents.EnqueuedTransportUri, onEnqueuedTransportUri);
-    events.on(SonosEvents.CurrentTransportState, onTransportState);
-    events.on(SonosEvents.Volume, onVolume);
-    events.on(SonosEvents.Mute, onMuted);
-    events.on(SonosEvents.Coordinator, onCoordinator);
-    events.on(SonosEvents.GroupName, onGroupName);
+    if (!group) {
+      return;
+    }
+    if (position) {
+      group.applyCurrentTrackUri(position.trackUri ?? '');
+      group.applyCurrentTrack(this.parseTrack(position.trackMetadata, host));
+      group.setPosition(parseClockToSec(position.relTime));
+    }
+    if (media) {
+      group.applyEnqueuedTrackUri(media.currentUri ?? '');
+      group.applyEnqueuedTrack(this.parseTrack(media.currentUriMetadata, host));
+    }
+    group.emitUpdated();
+  }
 
-    this.detachEventListeners.push(() => {
-      events.off(SonosEvents.CurrentTrackMetadata, onCurrentTrack);
-      events.off(SonosEvents.CurrentTrackUri, onCurrentTrackUri);
-      events.off(SonosEvents.EnqueuedTransportMetadata, onEnqueuedTransport);
-      events.off(SonosEvents.EnqueuedTransportUri, onEnqueuedTransportUri);
-      events.off(SonosEvents.CurrentTransportState, onTransportState);
-      events.off(SonosEvents.Volume, onVolume);
-      events.off(SonosEvents.Mute, onMuted);
-      events.off(SonosEvents.Coordinator, onCoordinator);
-      events.off(SonosEvents.GroupName, onGroupName);
-    });
+  private async startEvents(): Promise<void> {
+    const bridge = new S1EventBridge(
+      this.playerIp,
+      {
+        onTransport: (event) => {
+          if (event.transportState !== undefined) {
+            this.transportState = toTransportState(event.transportState);
+          }
+          const group = this.player?.group ?? null;
+          if (!group) return;
+          if (event.currentTrackUri !== undefined) {
+            group.applyCurrentTrackUri(event.currentTrackUri);
+          }
+          if (event.currentTrackMetadata !== undefined) {
+            group.applyCurrentTrack(this.parseTrack(event.currentTrackMetadata, this.playerIp));
+          }
+          if (event.enqueuedTransportUri !== undefined) {
+            group.applyEnqueuedTrackUri(event.enqueuedTransportUri);
+          }
+          if (event.enqueuedTransportMetadata !== undefined) {
+            group.applyEnqueuedTrack(this.parseTrack(event.enqueuedTransportMetadata, this.playerIp));
+          }
+          group.emitUpdated();
+        },
+        onRendering: (event) => {
+          if (event.volume !== undefined) this.volumeLevel = event.volume;
+          if (event.muted !== undefined) this.mutedState = event.muted;
+          this.player?.group?.emitUpdated();
+        },
+        onTopology: (groups) => {
+          if (this.stopRequested) return;
+          this.applyTopology(groups);
+        },
+      },
+      { port: this.port, logger: this.logger },
+    );
+    this.events = bridge;
+    try {
+      await bridge.start();
+    } catch (err) {
+      // Without events we still have the polls and the primed state, so this is a
+      // degraded connection rather than a failed one.
+      this.logger.warn?.('S1 event subscription failed; falling back to polling', {
+        host: this.playerIp,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private parseTrack(metadata: string | undefined, host: string): UpnpTrack | null {
+    return parseTrackMetadata(metadata, { host, port: this.port });
   }
 
   // -------- position polling --------
@@ -352,15 +393,15 @@ export class S1Client {
   }
 
   private async refreshPosition(): Promise<void> {
-    const device = this.device;
     const group = this.player?.group ?? null;
-    if (!device || !group) return;
-    if (group.playbackState !== 'PLAYBACK_STATE_PLAYING') return;
+    if (!group) return;
+    if (this.transportState !== UpnpTransportState.Playing) return;
     try {
-      const positionInfo = await device.AVTransportService.GetPositionInfo();
-      const positionSec = parseClockToSec(positionInfo?.RelTime);
-      if (positionSec !== null) {
-        group.setPosition(positionSec);
+      const { host, port } = this.coordinatorEndpointFor(group.id);
+      const position = await getPositionInfo(host, { port });
+      const seconds = parseClockToSec(position.relTime);
+      if (seconds !== null) {
+        group.setPosition(seconds);
         group.emitUpdated();
       }
     } catch {
@@ -369,12 +410,8 @@ export class S1Client {
   }
 }
 
-function parseClockToSec(clock: string | undefined): number | null {
-  if (!clock) return null;
-  const parts = clock.split(':').map((s) => Number(s));
-  if (parts.some((n) => !Number.isFinite(n))) return null;
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  if (parts.length === 1) return parts[0];
-  return null;
+function toTransportState(value: string | undefined): UpnpTransportState | undefined {
+  if (!value) return undefined;
+  const known = Object.values(UpnpTransportState) as string[];
+  return known.includes(value) ? (value as UpnpTransportState) : undefined;
 }

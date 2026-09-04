@@ -1,6 +1,6 @@
 {
   "name": "@sonn-audio/node-sonos",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "description": "Sonos Controller",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -22,7 +22,8 @@
     "build:cjs": "tsc -p tsconfig.json",
     "build:esm": "tsc -p tsconfig.esm.json && node -e \"const fs=require('fs');fs.mkdirSync('dist/esm',{recursive:true});fs.writeFileSync('dist/esm/package.json','{\\\"type\\\":\\\"module\\\"}\\n');\"",
     "clean": "rimraf dist",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "probe:s1": "node scripts/s1-probe.mjs"
   },
   "repository": {
     "type": "git",
@@ -45,7 +46,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@svrooij/sonos": "^2.5.0",
+    "@sonn-audio/node-upnp": "^0.4.2",
     "undici": "^6.19.8",
     "ws": "^8.18.0"
   },

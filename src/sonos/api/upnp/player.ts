@@ -1,7 +1,5 @@
 // S1-backed equivalent of SonosPlayer.
 
-import type SonosDevice from '@svrooij/sonos/lib/sonos-device';
-
 import { EventType } from '../../constants';
 import type { S1Client } from './client';
 import type { S1SonosGroup } from './group';
@@ -17,7 +15,6 @@ export class S1SonosPlayer {
 
   constructor(
     private readonly client: S1Client,
-    private readonly device: SonosDevice,
     private seed: S1PlayerSeed,
   ) {}
 
@@ -60,10 +57,9 @@ export class S1SonosPlayer {
   }
 
   async joinGroup(groupId: string): Promise<void> {
-    // @svrooij/sonos exposes JoinGroup on the device itself but the argument
-    // there is the *other device's name*, not a group id. We can't make this
-    // semantically equivalent to the S2 surface without more topology lookup,
-    // so we leave it as not-implemented and let the consumer fall back.
+    // Joining on S1 means pointing this player's transport at the coordinator
+    // (`x-rincon:<uuid>`), which the consumer's own SOAP path already does with the
+    // grouping semantics it wants. Leave it to them rather than guessing here.
     void groupId;
     throw new Error('S1: joinGroup not implemented; use direct SOAP via consumer');
   }

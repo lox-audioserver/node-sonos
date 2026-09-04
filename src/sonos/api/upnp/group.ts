@@ -1,13 +1,9 @@
-// S1-backed equivalent of SonosGroup, sitting on top of @svrooij/sonos.
+// S1-backed equivalent of SonosGroup.
 //
-// The state controller in lox-audioserver consumes a small slice of SonosGroup
+// The state controller in a consumer app reads a small slice of SonosGroup
 // (playbackState, playbackMetadataStatus, positionSeconds, activeService,
-// transport commands). This adapter forwards reads to a SonosDevice from
-// @svrooij/sonos and routes writes to the device's coordinator.
-
-import type SonosDevice from '@svrooij/sonos/lib/sonos-device';
-import { TransportState } from '@svrooij/sonos/lib/models';
-import type { Track } from '@svrooij/sonos/lib/models/track';
+// transport commands). This adapter answers those from the speaker state the
+// client keeps current, and routes commands to the group's coordinator.
 
 import { EventType } from '../../constants';
 import {
@@ -19,6 +15,8 @@ import {
   type QueueItem,
 } from '../../types';
 import type { S1Client } from './client';
+import { parseClockToSec } from './didl';
+import { UpnpTransportState, type UpnpTrack } from './models';
 
 export interface S1GroupSeed {
   id: string;
@@ -28,11 +26,10 @@ export interface S1GroupSeed {
 }
 
 export class S1SonosGroup {
-  // Track metadata snapshot kept in sync with the device's events. The device
-  // itself caches CurrentTrackUri/Coordinator/etc, but exposing it via our
-  // adapter requires us to mirror enough to satisfy the MetadataStatus shape.
-  private currentTrack: Track | null = null;
-  private enqueuedTrack: Track | null = null;
+  // Track metadata mirrored from the speaker's events, in the shape the
+  // MetadataStatus consumers expect.
+  private currentTrack: UpnpTrack | null = null;
+  private enqueuedTrack: UpnpTrack | null = null;
   private currentTrackUri = '';
   private enqueuedTrackUri = '';
   private positionAtUpdate = 0;
@@ -40,7 +37,6 @@ export class S1SonosGroup {
 
   constructor(
     private readonly client: S1Client,
-    private readonly device: SonosDevice,
     private seed: S1GroupSeed,
   ) {}
 
@@ -83,14 +79,19 @@ export class S1SonosGroup {
     return changed;
   }
 
-  // ----- state derived from the device -----
+  // ----- state derived from the speaker -----
 
   get playbackState(): PlayBackState {
-    const s = this.device.CurrentTransportStateSimple;
-    if (s === TransportState.Playing) return PlayBackState.PLAYING;
-    if (s === TransportState.Paused) return PlayBackState.PAUSED;
-    if (s === TransportState.Transitioning) return PlayBackState.BUFFERING;
-    return PlayBackState.IDLE;
+    switch (this.client.currentTransportState) {
+      case UpnpTransportState.Playing:
+        return PlayBackState.PLAYING;
+      case UpnpTransportState.PausedPlayback:
+        return PlayBackState.PAUSED;
+      case UpnpTransportState.Transitioning:
+        return PlayBackState.BUFFERING;
+      default:
+        return PlayBackState.IDLE;
+    }
   }
 
   get positionSeconds(): number {
@@ -124,44 +125,44 @@ export class S1SonosGroup {
   }
 
   get volume(): number | null {
-    const v = this.device.Volume;
-    return typeof v === 'number' ? v : null;
+    return this.client.currentVolume ?? null;
   }
 
   get muted(): boolean | null {
-    const m = this.device.Muted;
-    return typeof m === 'boolean' ? m : null;
+    return this.client.currentMuted ?? null;
   }
 
   // ----- transport commands (route to coordinator) -----
 
   async play(): Promise<void> {
-    await this.device.Coordinator.Play();
+    await this.client.runTransportCommand(this.id, 'Play');
   }
 
   async pause(): Promise<void> {
-    await this.device.Coordinator.Pause();
+    await this.client.runTransportCommand(this.id, 'Pause');
   }
 
   async stop(): Promise<void> {
-    await this.device.Coordinator.Stop();
+    await this.client.runTransportCommand(this.id, 'Stop');
   }
 
   async togglePlayPause(): Promise<void> {
-    await this.device.Coordinator.TogglePlayback();
+    // AVTransport has no toggle; pick the command from what the speaker is doing.
+    const playing = this.playbackState === PlayBackState.PLAYING;
+    await this.client.runTransportCommand(this.id, playing ? 'Pause' : 'Play');
   }
 
   async skipToNextTrack(): Promise<void> {
-    await this.device.Coordinator.Next();
+    await this.client.runTransportCommand(this.id, 'Next');
   }
 
   async skipToPreviousTrack(): Promise<void> {
-    await this.device.Coordinator.Previous();
+    await this.client.runTransportCommand(this.id, 'Previous');
   }
 
-  // ----- updates from the SDK's event stream -----
+  // ----- updates from the event stream -----
 
-  applyCurrentTrack(track: Track | null): void {
+  applyCurrentTrack(track: UpnpTrack | null): void {
     this.currentTrack = track;
     this.emitUpdated();
   }
@@ -171,7 +172,7 @@ export class S1SonosGroup {
     this.emitUpdated();
   }
 
-  applyEnqueuedTrack(track: Track | null): void {
+  applyEnqueuedTrack(track: UpnpTrack | null): void {
     this.enqueuedTrack = track;
     this.emitUpdated();
   }
@@ -202,24 +203,20 @@ export class S1SonosGroup {
         streamInfo: undefined,
       };
     }
-    const durationSec = parseClockToSec(track?.Duration);
+    const durationSec = parseClockToSec(track?.duration);
     const currentItem: QueueItem | undefined = track
       ? {
           _objectType: 'queueItem',
           id: `${this.id}:current`,
           track: {
             _objectType: 'track',
-            type: track.UpnpClass ?? 'audioItem',
-            name: track.Title ?? '',
-            mediaUrl: track.TrackUri || this.currentTrackUri || undefined,
-            artist: track.Artist
-              ? { _objectType: 'artist', name: track.Artist }
-              : undefined,
-            album: track.Album ? { _objectType: 'album', name: track.Album } : undefined,
+            type: track.upnpClass ?? 'audioItem',
+            name: track.title ?? '',
+            mediaUrl: track.trackUri || this.currentTrackUri || undefined,
+            artist: track.artist ? { _objectType: 'artist', name: track.artist } : undefined,
+            album: track.album ? { _objectType: 'album', name: track.album } : undefined,
             durationMillis: durationSec !== null ? durationSec * 1000 : undefined,
-            images: track.AlbumArtUri
-              ? [{ _objectType: 'image', url: track.AlbumArtUri }]
-              : undefined,
+            images: track.albumArtUri ? [{ _objectType: 'image', url: track.albumArtUri }] : undefined,
           },
         }
       : undefined;
@@ -227,11 +224,9 @@ export class S1SonosGroup {
       _objectType: 'metadataStatus',
       currentItem,
       container,
-      // @svrooij/sonos doesn't surface ICY r:streamContent as a discrete field.
-      // Radio metadata typically arrives via the next CurrentTrack event with
-      // a Title carrying the broadcast string, which the consumer picks up via
-      // currentItem.track.name.
-      streamInfo: undefined,
+      // Radio carries its now-playing line out-of-band, in Sonos's r:streamContent,
+      // while dc:title stays on the station name.
+      streamInfo: track?.streamContent,
     };
   }
 }
@@ -239,16 +234,16 @@ export class S1SonosGroup {
 function buildContainer(
   currentUri: string,
   enqueuedUri: string,
-  enqueuedTrack: Track | null,
+  enqueuedTrack: UpnpTrack | null,
 ): Container | undefined {
   const containerType = inferContainerType(currentUri, enqueuedUri, enqueuedTrack);
   if (!enqueuedUri && !enqueuedTrack) return undefined;
   return {
     _objectType: 'container',
-    name: enqueuedTrack?.Title ?? '',
+    name: enqueuedTrack?.title ?? '',
     type: containerType ?? 'unknown',
-    images: enqueuedTrack?.AlbumArtUri
-      ? [{ _objectType: 'image', url: enqueuedTrack.AlbumArtUri }]
+    images: enqueuedTrack?.albumArtUri
+      ? [{ _objectType: 'image', url: enqueuedTrack.albumArtUri }]
       : undefined,
   };
 }
@@ -256,7 +251,7 @@ function buildContainer(
 function inferContainerType(
   currentUri: string,
   enqueuedUri: string,
-  track: Track | null,
+  track: UpnpTrack | null,
 ): ContainerType | string | null {
   const probe = `${currentUri} ${enqueuedUri}`.toLowerCase();
   if (probe.includes('x-rincon-stream:')) return ContainerType.LINEIN;
@@ -266,7 +261,7 @@ function inferContainerType(
   }
   if (probe.includes('x-sonos-vli:')) return ContainerType.AIRPLAY;
   if (probe.includes('x-sonos-spotify:')) return 'spotify';
-  const upnpClass = track?.UpnpClass?.toLowerCase() ?? '';
+  const upnpClass = track?.upnpClass?.toLowerCase() ?? '';
   if (upnpClass.includes('audiobroadcast')) return ContainerType.STATION;
   if (upnpClass.includes('musictrack')) return ContainerType.PLAYLIST;
   return null;
@@ -278,15 +273,5 @@ function inferActiveService(currentUri: string): string | null {
   if (uri.includes('tunein') || uri.startsWith('x-sonosapi-stream:')) return MusicService.TUNEIN;
   if (uri.startsWith('x-rincon-stream:')) return 'linein';
   if (uri.startsWith('x-sonos-vli:')) return 'airplay';
-  return null;
-}
-
-function parseClockToSec(clock: string | undefined): number | null {
-  if (!clock) return null;
-  const parts = clock.split(':').map((s) => Number(s));
-  if (parts.some((n) => !Number.isFinite(n))) return null;
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  if (parts.length === 1) return parts[0];
   return null;
 }

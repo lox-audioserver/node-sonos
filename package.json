@@ -27,12 +27,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lox-audioserver/node-sonos.git"
+    "url": "git+https://github.com/sonn-audio/node-sonos.git"
   },
   "bugs": {
-    "url": "https://github.com/lox-audioserver/node-sonos/issues"
+    "url": "https://github.com/sonn-audio/node-sonos/issues"
   },
-  "homepage": "https://github.com/lox-audioserver/node-sonos#readme",
+  "homepage": "https://github.com/sonn-audio/node-sonos#readme",
   "keywords": [
     "sonos",
     "controller",
